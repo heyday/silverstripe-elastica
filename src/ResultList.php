@@ -41,6 +41,22 @@ class ResultList extends ViewableData implements SS_List
             '_type'
         ));
 
+        // update the 'source' param of the query to ensure ID and ClassName are retrieved
+        if ($query->hasParam('_source')) {
+            $source = $query->getParam('_source');
+            $source[] = 'ID';
+            $source[] = 'ClassName';
+            $source = array_unique($source);
+            
+        } else {
+            $source = [
+                'ID',
+                'ClassName'
+            ];
+        }
+        $query->setSource($source);
+        
+
         //If we are in live reading mode, only return published documents
         if (Versioned::get_reading_mode() == Versioned::DEFAULT_MODE) {
             $publishedFilter = new Query\BoolQuery();
@@ -171,13 +187,20 @@ class ResultList extends ViewableData implements SS_List
             if (is_array($found) || $found instanceof \ArrayAccess) {
 
                 foreach ($found as $item) {
-                    $type = $item->getType();
+                    $data = $item->getData();
+
+                    // note(Marcus) 2018-01-24:
+                    //      Swapped to using the ClassName and ID fields introduced elsewhere
+                    //      due to _type being deprecated
+                    //      https://www.elastic.co/guide/en/elasticsearch/reference/current/mapping-type-field.html
+                    $type = isset($data['ClassName']) ? $data['ClassName'] : $item->getType();
+                    $id = isset($data['ID']) ? $data['ID'] : $item->getId();
 
                     if (!array_key_exists($type, $needed)) {
-                        $needed[$type] = array($item->getId());
+                        $needed[$type] = array($id);
                         $retrieved[$type] = array();
                     } else {
-                        $needed[$type][] = $item->getId();
+                        $needed[$type][] = $id;
                     }
                 }
 
@@ -188,9 +211,12 @@ class ResultList extends ViewableData implements SS_List
                 }
 
                 foreach ($found as $item) {
+                    $data = $item->getData();
+                    $type = isset($data['ClassName']) ? $data['ClassName'] : $item->getType();
+                    $id = isset($data['ID']) ? $data['ID'] : $item->getId();
                     // Safeguards against indexed items which might no longer be in the DB
-                    if (array_key_exists($item->getId(), $retrieved[$item->getType()])) {
-                        $this->resultsArray[] = $retrieved[$item->getType()][$item->getId()];
+                    if (array_key_exists($id, $retrieved[$type])) {
+                        $this->resultsArray[] = $retrieved[$type][$id];
                     }
                 }
             }
