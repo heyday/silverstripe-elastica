@@ -2,19 +2,30 @@
 
 namespace Heyday\Elastica;
 
+use ArrayAccess;
+use ArrayIterator;
+use BadMethodCallException;
 use Elastica\Index;
 use Elastica\Query;
+use Elastica\Result;
 use Elastica\ResultSet;
+use Exception;
+use LogicException;
 use Psr\Log\LoggerInterface;
 use SilverStripe\ORM\ArrayList;
+use SilverStripe\ORM\DataObject;
+use SilverStripe\ORM\Limitable;
+use SilverStripe\ORM\Map;
 use SilverStripe\ORM\SS_List;
 use SilverStripe\Versioned\Versioned;
+use SilverStripe\View\ArrayData;
 use SilverStripe\View\ViewableData;
+use Traversable;
 
 /**
  * A list wrapper around the results from a query. Note that not all operations are implemented.
  */
-class ResultList extends ViewableData implements SS_List
+class ResultList extends ViewableData implements SS_List, Limitable
 {
 
     /**
@@ -35,16 +46,19 @@ class ResultList extends ViewableData implements SS_List
 
     public function __construct(Index $index, Query $query, LoggerInterface $logger = null)
     {
+        parent::__construct();
+
         //Optimise the query by just getting back the ids and types
-        $query->setStoredFields(array(
+        $query->setStoredFields([
             '_id',
-            '_type'
-        ));
+            Searchable::TYPE_FIELD,
+            'highlight'
+        ]);
 
         //If we are in live reading mode, only return published documents
-        if (Versioned::get_reading_mode() == Versioned::DEFAULT_MODE) {
+        if (Versioned::get_stage() == Versioned::LIVE) {
             $publishedFilter = new Query\BoolQuery();
-            $publishedFilter->addMust(new Query\Term([Searchable::$published_field => 'true']));
+            $publishedFilter->addMust(new Query\Term([Searchable::PUBLISHED_FIELD => 'true']));
             $query->setPostFilter($publishedFilter);
         }
 
@@ -69,7 +83,7 @@ class ResultList extends ViewableData implements SS_List
      */
     public function getIDs()
     {
-        /** @var $found \Elastica\Result[] */
+        /** @var $found Result[] */
         $found = $this->getResults();
 
         $ids = array();
@@ -82,7 +96,7 @@ class ResultList extends ViewableData implements SS_List
     }
 
     /**
-     * @return \Elastica\Index
+     * @return Index
      */
     public function getIndex()
     {
@@ -90,7 +104,7 @@ class ResultList extends ViewableData implements SS_List
     }
 
     /**
-     * @return \Elastica\Query
+     * @return Query
      */
     public function getQuery()
     {
@@ -98,14 +112,14 @@ class ResultList extends ViewableData implements SS_List
     }
 
     /**
-     * @return array|\Elastica\ResultSet
+     * @return array|ResultSet
      */
     public function getResults()
     {
         if (is_null($this->resultSet)) {
             try {
                 $this->resultSet = $this->index->search($this->query);
-            } catch (\Exception $e) {
+            } catch (Exception $e) {
                 if ($this->logger) {
                     $this->logger->critical($e->getMessage());
                 }
@@ -116,15 +130,15 @@ class ResultList extends ViewableData implements SS_List
     }
 
     /**
-     * @return \ArrayIterator|\Traversable
+     * @return ArrayIterator|Traversable
      */
     public function getIterator()
     {
-        return new \ArrayIterator($this->toArray());
+        return new ArrayIterator($this->toArray());
     }
 
     /**
-     * @param $limit
+     * @param     $limit
      * @param int $offset
      * @return ResultList
      */
@@ -167,29 +181,50 @@ class ResultList extends ViewableData implements SS_List
             $needed = array();
             $retrieved = array();
 
-            if (is_array($found) || $found instanceof \ArrayAccess) {
+            if (is_array($found) || $found instanceof ArrayAccess) {
                 foreach ($found as $item) {
-                    $type = $item->getType();
-
+                    $type = $item->{Searchable::TYPE_FIELD};
+                    if (empty($type)) {
+                        throw new LogicException("type field not available");
+                    }
                     if (!array_key_exists($type, $needed)) {
-                        $needed[$type] = array($item->getId());
-                        $retrieved[$type] = array();
+                        $needed[$type] = [$item->getId()];
+                        $retrieved[$type] = [];
                     } else {
                         $needed[$type][] = $item->getId();
                     }
                 }
 
                 foreach ($needed as $class => $ids) {
-                    foreach ($class::get()->byIDs($ids) as $record) {
+                    foreach (DataObject::get($class)->byIDs($ids) as $record) {
                         $retrieved[$class][$record->ID] = $record;
                     }
                 }
 
                 foreach ($found as $item) {
                     // Safeguards against indexed items which might no longer be in the DB
-                    if (array_key_exists($item->getId(), $retrieved[$item->getType()])) {
-                        $this->resultsArray[] = $retrieved[$item->getType()][$item->getId()];
+                    $type = $item->{Searchable::TYPE_FIELD};
+                    if (empty($type)) {
+                        throw new LogicException("type field not available");
                     }
+                    $id = $item->getId();
+                    if (!isset($retrieved[$type][$id])) {
+                        continue;
+                    }
+
+                    $highlights = $item->getHighlights();
+                    $highlightsArray = [];
+                    foreach ($highlights as $field => $highlight) {
+                        $concatenatedValue = '';
+                        foreach ($highlight as $key => $value) {
+                            $concatenatedValue .= $value;
+                        }
+                        $highlightsArray[$field] = $concatenatedValue;
+                    }
+
+                    //add Highlights property
+                    $retrieved[$type][$id]->highlights = new ArrayData($highlightsArray);
+                    $this->resultsArray[] = $retrieved[$type][$id];
                 }
             }
         }
@@ -224,7 +259,8 @@ class ResultList extends ViewableData implements SS_List
      */
     public function first()
     {
-        return reset($this->toArray());
+        $list = $this->toArray();
+        return reset($list);
     }
 
     /**
@@ -232,14 +268,15 @@ class ResultList extends ViewableData implements SS_List
      */
     public function last()
     {
-        return array_pop($this->toArray());
+        $list = $this->toArray();
+        return array_pop($list);
     }
 
 
     /**
      * @param string $key
      * @param string $title
-     * @return \SilverStripe\ORM\Map
+     * @return Map
      */
     public function map($key = 'ID', $title = 'Title')
     {
@@ -266,12 +303,13 @@ class ResultList extends ViewableData implements SS_List
     }
 
     /**
-     * @param $callback
+     * @param callable $callback
      * @return $this
      */
     public function each($callback)
     {
-        return $this->toArrayList()->each($callback);
+        $this->toArrayList()->each($callback);
+        return $this;
     }
 
     /**
@@ -290,59 +328,40 @@ class ResultList extends ViewableData implements SS_List
         return $this->getResults()->getTotalHits();
     }
 
-    /**
-     * @ignore
-     */
     public function offsetExists($offset)
     {
-        throw new \Exception();
+        $array = $this->toArray();
+        return array_key_exists($offset, $array);
     }
 
-    /**
-     * @ignore
-     */
     public function offsetGet($offset)
     {
-        throw new \Exception();
+        $array = $this->toArray();
+        return isset($array[$offset]) ? $array[$offset] : null;
     }
 
-    /**
-     * @ignore
-     */
-    public function offsetSet($offset, $value)
-    {
-        throw new \Exception();
-    }
-
-    /**
-     * @ignore
-     */
-    public function offsetUnset($offset)
-    {
-        throw new \Exception();
-    }
-
-    /**
-     * @ignore
-     */
-    public function add($item)
-    {
-        throw new \Exception();
-    }
-
-    /**
-     * @ignore
-     */
-    public function remove($item)
-    {
-        throw new \Exception();
-    }
-
-    /**
-     * @ignore
-     */
     public function find($key, $value)
     {
-        throw new \Exception();
+        return $this->toArrayList()->find($key, $value);
+    }
+
+    public function offsetSet($offset, $value)
+    {
+        throw new BadMethodCallException("ResultList cannot be modified in memory");
+    }
+
+    public function offsetUnset($offset)
+    {
+        throw new BadMethodCallException("ResultList cannot be modified in memory");
+    }
+
+    public function add($item)
+    {
+        throw new BadMethodCallException("ResultList cannot be modified in memory");
+    }
+
+    public function remove($item)
+    {
+        throw new BadMethodCallException("ResultList cannot be modified in memory");
     }
 }
